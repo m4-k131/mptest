@@ -66,7 +66,14 @@ def cmd_orders(args):
         for rec in army_orders:
             pname  = prov_names.get(rec['province'], f"prov {rec['province']}")
             nname  = NATION_IDS.get(rec['nation_id'], f"0x{rec['nation_id']:04X}")
-            print(f"  {rec['province']:>4}  {pname:<24}  {nname:>8}  {rec['order_code']:>5}  {order_name(rec['order_code'])}")
+            pd_str = str(rec['pd']) if rec.get('pd') else '-'
+            line = f"  {rec['province']:>4}  {pname:<24}  {nname:>8}  {pd_str:>3}  {rec['order_code']:>5}  {order_name(rec['order_code'])}"
+            recs = rec.get('recruits', {})
+            if recs.get('commanders'):
+                line += '  [cmdrs: ' + ', '.join(f"type{u}(g{c})" for u, c in recs['commanders']) + ']'
+            if recs.get('units'):
+                line += '  [units: ' + ', '.join(f"type{u}(g{c})" for u, c in recs['units']) + ']'
+            print(line)
         print()
 
     # Named commander move targets
@@ -82,12 +89,13 @@ def cmd_orders(args):
         print(f"  {'Name':<20}  {'Type':>5}  {'Serial':>8}  Order")
         print("  " + "-" * 60)
         for c in commanders:
-            if c.target_prov:
+            if c.is_moving and c.target_prov:
                 tname = prov_names_fth.get(c.target_prov, f'prov {c.target_prov}')
                 order_str = f'move -> {c.target_prov} ({tname})'
             else:
-                order_str = 'hold/search'
-            print(f"  {c.name:<20}  {c.cmdr_type:>5}  {c.serial:>8}  {order_str}")
+                order_str = c.order
+            extra = f'  [{c.battle_order}]' if c.battle_order else ''
+            print(f"  {c.name:<20}  {c.cmdr_type:>5}  {c.serial:>8}  {order_str}{extra}")
     print()
 
 

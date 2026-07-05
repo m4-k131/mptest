@@ -194,10 +194,22 @@ class CommanderRecord:
     cmdr_type: int      # u16 at name_off - 4
     serial: int         # u32 at name_off + len(name) + 1
     target_prov: int    # 0 = no move order
+    order_code: int = 7        # byte at nend+164; 7=hold/search, 8=blood hunt, etc.
+    battle_order_code: int = 0 # byte at nend+198
+
+    @property
+    def is_moving(self) -> bool:
+        return self.order_code in (1, 2)
 
     @property
     def order(self) -> str:
-        return f'move -> {self.target_prov}' if self.target_prov else 'hold/search'
+        if self.is_moving and self.target_prov:
+            return f'move -> {self.target_prov}'
+        return cmdr_order_name(self.order_code)
+
+    @property
+    def battle_order(self) -> str:
+        return battle_order_name(self.battle_order_code)
 
 
 def scan_commanders(data: bytes) -> list[CommanderRecord]:
@@ -224,7 +236,7 @@ def scan_commanders(data: bytes) -> list[CommanderRecord]:
             if 32 <= fc < 127:
                 ctype = struct.unpack_from('<H', data, i - 4)[0]
                 # Unit type IDs for named commanders are in 0x0100-0x03FF range
-                if 0x0100 <= ctype <= 0x03FF:
+                if 0x0050 <= ctype <= 0x03FF:
                     name_off = i
                     # All bytes must decode to printable ASCII
                     end = name_off
@@ -240,10 +252,13 @@ def scan_commanders(data: bytes) -> list[CommanderRecord]:
                             if serial not in seen_serials:
                                 seen_serials.add(serial)
                                 tp = _read_move_target(data, nend)
+                                ocode = data[nend + 164] if nend + 165 <= len(data) else 7
+                                bcode = data[nend + 198] if nend + 199 <= len(data) else 0
                                 results.append(CommanderRecord(
                                     name=name, name_off=name_off,
                                     cmdr_type=ctype, serial=serial,
-                                    target_prov=tp,
+                                    target_prov=tp, order_code=ocode,
+                                    battle_order_code=bcode,
                                 ))
         i += 1
     results.sort(key=lambda r: r.name_off)
@@ -284,8 +299,8 @@ ORDER_NAMES = {
     2:  'Move',
     7:  'Defend',
     45: 'Defend',              # observed: nocommands default (variant code)
-    8:  'Reanimate Soulless',   # observed: Ermor prov 156, persistent standing order
-    9:  'Reanimate Longdead',   # observed: Ermor prov 156 (variant)
+    8:  'Reanimate Soulless',   # observed: Ermor province order
+    9:  'Reanimate Longdead',   # observed: Ermor province order (variant)
     10: 'Patrol',
     15: 'Pillage',
     19: 'Forge',
@@ -294,6 +309,36 @@ ORDER_NAMES = {
     42: 'Attack',
     50: 'Recruit (capital)',
 }
+
+# Commander personal order codes (byte at nend+164 in commander record)
+CMDR_ORDER_NAMES = {
+    0:  'defend',          # confirmed: Mithok, Ermor turn 4
+    1:  'move',
+    4:  'research',        # confirmed: Vekhithu, Ermor turn 4
+    7:  'hold/search',
+    8:  'blood hunt',      # confirmed: Elle, Jotunheim turn 4
+    9:  'unknown(9)',     # observed: Vekhithu pre-research (scry? another order?)
+    10: 'patrol',
+    18: 'build lab',            # confirmed: Pyenv, Ermor turn 4
+    19: 'build temple',         # confirmed: Mithok, Ermor turn 4
+    20: 'build palisades',      # confirmed: Pyenv, Ermor turn 4
+    21: 'reanimate (ghouls)',   # confirmed: Zrakhnadar, Ermor turn 4 (pre-soulless)
+    22: 'reanimate soulless',   # confirmed: Zrakhnadar, Ermor turn 4
+    23: 'reanimate longdead',   # confirmed: Zrakhnadar, Ermor turn 4
+    85: 'search (auto)',  # confirmed: Elle, Jotunheim turn 4
+}
+
+# Commander battle order codes (byte at nend+198 in commander record)
+BATTLE_ORDER_NAMES = {
+    0:  '',
+    10: 'stay behind troops',  # confirmed: Pyenv, Ermor turn 4
+}
+
+def cmdr_order_name(code: int) -> str:
+    return CMDR_ORDER_NAMES.get(code, f'unknown({code})')
+
+def battle_order_name(code: int) -> str:
+    return BATTLE_ORDER_NAMES.get(code, f'battle:{code}')
 
 def order_name(code: int) -> str:
     if code in ORDER_NAMES:
@@ -348,25 +393,25 @@ def find_order_records(data: bytes) -> list[dict]:
             # Skip both XOR name strings (province name appears twice)
             after_names  = name_start + len(name) + 1
             after_names2 = after_names + len(xor_decode(data, after_names, 64)) + 1
-            # After names: 24×00, then [u16 ??][u16 cmdr_count][u16 unit_count][u16 ??]
-            #              then 12 bytes unit/nation block, then u16 pd
-            base = after_names2 + 24      # skip 24 zero bytes
-            pd_off = base + 8 + 12        # skip 4×u16 + 12-byte block
+            # After names: fixed 56-byte province stats block, then FF FF recruit list.
+            # Layout:
+            #   base+ 0: [u16 ??][u16 ??][u16 ??][u16 ??]        (8 bytes, entry 0 header)
+            #   base+ 8: entry 0 [12 bytes, all zeros typically]
+            #   base+20: entry 1 [u16 ??][u16 ??][u16 ??][u16 cmdr_count][u16 unit_count][u16 ??]
+            #   base+32: entry 2 [u16 income][u16 nation][u16 nation][u16 nation][u16 ??][u16 ??]
+            #   base+44: entry 3 [u16 pd][u16 ...more stats...]
+            #   base+56: FF FF   <- recruit list separator
+            base   = after_names2
+            ff_off = base + 56
             pd = 0
             cmdr_recruit_count = 0
             unit_recruit_count = 0
             recruits = []
-            if pd_off + 2 <= len(data):
-                cmdr_recruit_count = min(struct.unpack_from('<H', data, base + 2)[0], 32)
-                unit_recruit_count = min(struct.unpack_from('<H', data, base + 4)[0], 32)
+            if ff_off + 1 < len(data) and data[ff_off] == 0xFF and data[ff_off+1] == 0xFF:
+                cmdr_recruit_count = min(struct.unpack_from('<H', data, base + 26)[0], 32)
+                unit_recruit_count = min(struct.unpack_from('<H', data, base + 28)[0], 32)
                 recruit_count = cmdr_recruit_count + unit_recruit_count
-                pd = struct.unpack_from('<H', data, pd_off)[0]
-                # Recruits: FF FF separator then N×[unit_type u16, count u16, 00 00 00 00]
-                ff_off = pd_off
-                while ff_off < pd_off + 32 and ff_off + 1 < len(data):
-                    if data[ff_off] == 0xFF and data[ff_off+1] == 0xFF:
-                        break
-                    ff_off += 1
+                pd = data[base + 44]   # low byte only; high byte is flags
                 if ff_off + 1 < len(data) and data[ff_off] == 0xFF:
                     r_off = ff_off + 2
                     n = min(recruit_count, 32)
@@ -391,6 +436,8 @@ def find_order_records(data: bytes) -> list[dict]:
             nation_id = 0
             if pre5_off + 3 <= len(data) and pre5_off >= 0:
                 nation_id = struct.unpack_from('<H', data, pre5_off + 1)[0]
+            # army = nation has standing presence; commander = pure province order
+            # Note: a record can be 'army' AND have recruits (e.g. capital province)
             rtype = 'army' if nation_id else 'commander'
             results.append({
                 'offset':        idx,

@@ -6,3 +6,5 @@ data/*
 *.d6m
 *.map
 ftherlnd
+backups/*
+_probe*
